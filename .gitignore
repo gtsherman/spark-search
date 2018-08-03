@@ -1,0 +1,9 @@
+# directories
+.idea/
+__pycache__/
+data/
+venv/
+
+# files
+*.csv
+*.pyc
