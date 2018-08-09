@@ -1,25 +1,46 @@
+import importlib
 import json
 import math
 import os
+import sys
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
-from pprint import pprint
 
 from bs4 import BeautifulSoup
 from pyspark import SparkConf, SparkContext
 
 import preprocess
-from index import Tokenizer
 
 
 def arguments():
+    required = ['index', 'queries', 'out']
+
     options = ArgumentParser(description='Run a sequential scan style search of documents')
-    required = options.add_argument_group('required arguments')
-    required.add_argument('-i', '--index', help='The pseudo-index created with preprocess.py.', required=True)
-    required.add_argument('-q', '--queries', help='A file containing all queries to be run.', required=True)
-    options.add_argument('-f', '--field', action='append', help='A field to include in the index.', default=('text',))
+    options.add_argument('config', help='The configuration file.')
+    options.add_argument('-i', '--index', help='The pseudo-index created with preprocess.py.')
+    options.add_argument('-q', '--queries', help='A file containing all queries to be run.')
     options.add_argument('-l', '--limit', type=int, help='The number of documents to return scores for.', default=1000)
-    return options.parse_args()
+    options.add_argument('-o', '--out', help='The file (local filesystem) to record search results in.')
+    args = options.parse_args()
+
+    # Load the configuration file
+    try:
+        conf = importlib.import_module(args.config.replace('.py', ''))
+    except ImportError:
+        sys.exit('You must specify a configuration file.')
+
+    # Update the config with command line arguments, if relevant
+    for option in vars(args):
+        if getattr(args, option) is not None:
+            setattr(conf, option, getattr(args, option))
+
+    for required_setting in required:
+        val = getattr(conf, required_setting)
+        if val is None:
+            raise RuntimeError('You must provide a value for {} in your configuration file or command line '
+                               'parameters.'.format(required_setting))
+
+    return conf
 
 
 def load_queries(queries_file, file_format=None):
@@ -52,13 +73,89 @@ def _parse_title_queries(queries_raw):
             queries_soup.find_all('query')}
 
 
-def all_query_terms(queries):
-    return set([term for q in queries for term in queries[q]])
+def document_process_pipeline(*transformations):
+    def _transform(document):
+        for transformation in transformations:
+            document = transformation(document)
+        return document
+    return _transform
 
 
-def dirichlet_scorer(queries, term_collection_probabilities, mu=2500):
-    def _with_document_vector(document):
+class DocumentHandler(object):
+    def __init__(self, spark_context, queries, config, **kwargs):
+        self.spark_context = spark_context
+        self.queries = queries
+        for arg in kwargs:
+            setattr(self, arg, kwargs[arg])
+
+        self.collection_stats = spark_context.sequenceFile(os.path.join(config.index, preprocess.COLLECTION_STATS))
+        self.collection_total_terms = self.collection_stats.collectAsMap()[preprocess.TOTAL_TERMS]
+
+        self.collection_term_counts = spark_context.sequenceFile(os.path.join(config.index, preprocess.COLLECTION_TERM_COUNTS))
+
+        self.document_format = spark_context.sequenceFile(os.path.join(config.index, preprocess.DOC_FORMAT)).collectAsMap()[
+            'format']
+
+    @staticmethod
+    def all_query_terms(queries):
+        return set([term for q in queries for term in queries[q]])
+
+
+class DirichletDocumentHandler(DocumentHandler):
+    def document_processing(self):
+        return document_process_pipeline(preprocess.parsers[self.document_format](preprocess.Tokenizer()).parse, Counter)
+
+    def scorer(self):
+        query_term_collection_probabilities = self._collection_probs()
+        return DirichletScorer(self.queries, self.collection_total_terms, query_term_collection_probabilities)
+
+    def _collection_probs(self):
+        collection_total_terms = self.collection_total_terms
+        all_query_terms = self.all_query_terms
+        queries = self.queries
+
+        return self.collection_term_counts \
+            .filter(lambda term_count: term_count[0] in all_query_terms(queries)) \
+            .map(lambda term_count: (term_count[0], term_count[1] / collection_total_terms)) \
+            .collectAsMap()
+
+
+class Scorer(object):
+    def __init__(self, queries):
+        self.queries = queries
+
+
+class DirichletScorer(Scorer):
+    def __init__(self, queries, collection_total_terms=1, term_collection_probabilities=None, mu=2500):
+        super().__init__(queries)
+        self.term_collection_probabilities = term_collection_probabilities
+        self.collection_total_terms = collection_total_terms
+        self.mu = mu
+
+    def _default_prob(self):
+        collection_total_terms = self.collection_total_terms
+        return 1 / collection_total_terms
+
+    def score(self, document):
+        """
+        Scores a list of queries against a document using Dirichlet-smoothed query likelihood scoring.
+        :param document: A dictionary of type {term: term_count}
+        :return: A list of (query_title, query_probability) tuples for each query provided.
+        """
+
+        # A weird little hack that makes Spark processing more efficient by allowing the function to be shipped
+        # without the remainder of the scorer object.
+        queries = self.queries
+        term_collection_probabilities = self.term_collection_probabilities
+        mu = self.mu
+
         document_vector = document
+
+        # Term probabilities default to 0 if none are provided
+        if term_collection_probabilities is None:
+            term_collection_probabilities = defaultdict(int)
+        else:
+            term_collection_probabilities = defaultdict(self._default_prob, term_collection_probabilities)
 
         # Document length is the sum of the counts of the individual terms in the document
         document_length = sum(document_vector.values())
@@ -77,12 +174,11 @@ def dirichlet_scorer(queries, term_collection_probabilities, mu=2500):
 
         return query_doc_scores
 
-    return _with_document_vector
-
 
 def trec_format(results, run_name='submitted'):
     """
     Convert the results to a very long string in TREC format.
+    :param run_name: The run name. Default: "submitted"
     :param results: A {query: [(docno, score), ...]} dictionary.
     :return: A string representation of the results in TREC format.
     """
@@ -91,61 +187,46 @@ def trec_format(results, run_name='submitted'):
         query_list = sorted(results[query], key=lambda doc_score: -doc_score[1])
         for i, doc_score in enumerate(query_list):
             trec.append('{query} Q0 {docno} {rank} {score} {run}'.format(query=query, docno=doc_score[0],
-                                                                         rank=str(i+1), score=str(doc_score[1]),
+                                                                         rank=str(i + 1), score=str(doc_score[1]),
                                                                          run=run_name))
     return '\n'.join(trec)
 
 
 if __name__ == '__main__':
-    args = arguments()
+    config = arguments()
 
-    queries = load_queries(args.queries)
+    queries = load_queries(config.queries)
+    limit = config.limit
 
     sc = SparkContext(conf=SparkConf().setAppName('convert'))
 
-    collection_stats = sc.sequenceFile(os.path.join(args.index, preprocess.COLLECTION_STATS))
-    collection_total_terms = collection_stats.collectAsMap()[preprocess.TOTAL_TERMS]
+    try:
+        doc_handler = config.doc_handler
+    except AttributeError:
+        doc_handler = DirichletDocumentHandler
 
-    collection_term_counts = sc.sequenceFile(os.path.join(args.index, preprocess.COLLECTION_TERM_COUNTS))
+    # Provide the document handler with any information we can glean from the index as well as the queries etc.
+    doc_handler = doc_handler(sc, queries, config)
 
-    def _default_prob():
-        return 1 / collection_total_terms
+    process_document = doc_handler.document_processing()
+    scorer = doc_handler.scorer()
 
-    # Assume that the total number of query terms is relatively manageable since we need just one value for each term
-    query_term_collection_probabilities = defaultdict(_default_prob)
-    query_term_collection_probabilities.update(collection_term_counts
-                                               .filter(lambda term_count: term_count[0] in all_query_terms(queries))
-                                               .map(lambda term_count: (term_count[0], term_count[1] /
-                                                                        collection_total_terms))
-                                               .collectAsMap())
+    docs = sc.sequenceFile(os.path.join(config.index, preprocess.FLATTENED_DOCS))
 
-    scorer = dirichlet_scorer(queries, query_term_collection_probabilities)
-
-    tokenizer = Tokenizer()
-
-    def _field_terms(doc):
-        docno = doc.docno.text.upper()
-        counter = Counter()
-        for field in args.field:
-            for section in doc.find_all(field):
-                tokens = tokenizer.process(section.text.strip())
-                counter.update(tokens)
-        return docno, counter
-
-    docs = sc.textFile(os.path.join(args.index, preprocess.FLATTENED_DOCS))
-
-    # groupByKey throwing error
-    results = docs \
-        .map(lambda doc: BeautifulSoup(doc, 'html.parser')) \
-        .map(_field_terms) \
-        .flatMapValues(scorer) \
+    scored_docs = docs \
+        .mapValues(process_document) \
+        .flatMapValues(scorer.score) \
         .map(lambda x: (x[1][0], x[0], x[1][1])) \
         .groupBy(lambda x: x[0]) \
-        .mapValues(lambda document_scores: sorted(document_scores, key=lambda ds: -ds[1])[:args.limit]) \
-        .flatMapValues(lambda ds: (ds.docno, ds.score)) \
+        .mapValues(lambda document_scores: sorted(document_scores, key=lambda ds: -ds[2])[:limit]) \
+        .flatMapValues(lambda ds: [(t[0], t[1], t[2]) for t in ds]) \
+        .map(lambda x: x[1]) \
         .collect()
-        #.takeOrdered(args.limit, key=lambda d: -d[1])
 
-    trec_results = trec_format(results)
+    r = defaultdict(list)
+    for result in scored_docs:
+        query_title, returned = result[0], result[1:]
+        r[query_title].append(returned)
 
-    sc.parallelize(trec_results.split('\n')).saveAsTextFile('ap-results')
+    with open(config.out, 'w') as out:
+        print(trec_format(r), file=out)
