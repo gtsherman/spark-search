@@ -7,6 +7,7 @@ from argparse import ArgumentParser
 from collections import Counter
 from operator import add
 
+import stemming.porter2
 from bs4 import BeautifulSoup
 from pyspark import SparkContext, SparkConf
 
@@ -47,13 +48,12 @@ class Tokenizer(object):
         return token.strip()
 
     @staticmethod
-    def stem(token):
-        """
-        TO DO
-        :param token:
-        :return: A stemmed token
-        """
-        return token
+    def stem(token, stemmer=stemming.porter2):
+        return stemmer.stem(token)
+
+    @staticmethod
+    def stop(token, stoplist):
+        return token if stoplist.is_stopword(token) else ''
 
 
 class Parser(object):

@@ -64,13 +64,14 @@ def load_queries(queries_file, file_format=None):
 
 def _parse_json_queries(queries_raw):
     queries_json = json.loads(queries_raw)
-    return {query['title']: query['text'].strip().lower().split() for query in queries_json['queries']}
+    return {query['title']: [term for term in query['text'].strip().lower().split() if term] for query in queries_json[
+        'queries']}
 
 
 def _parse_title_queries(queries_raw):
     queries_soup = BeautifulSoup(queries_raw, 'html.parser')  # not actually HTML, but it works fine
-    return {query.number.text.strip(): query.find('text').text.strip().lower().split() for query in
-            queries_soup.find_all('query')}
+    return {query.number.text.strip(): [term for term in query.find('text').text.strip().lower().split() if term] for
+                                        query in queries_soup.find_all('query')}
 
 
 def document_process_pipeline(*transformations):
@@ -85,16 +86,27 @@ class DocumentHandler(object):
     def __init__(self, spark_context, queries, config, **kwargs):
         self.spark_context = spark_context
         self.queries = queries
+        self.config = config
         for arg in kwargs:
             setattr(self, arg, kwargs[arg])
 
         self.collection_stats = spark_context.sequenceFile(os.path.join(config.index, preprocess.COLLECTION_STATS))
         self.collection_total_terms = self.collection_stats.collectAsMap()[preprocess.TOTAL_TERMS]
 
-        self.collection_term_counts = spark_context.sequenceFile(os.path.join(config.index, preprocess.COLLECTION_TERM_COUNTS))
+        self.collection_term_counts = spark_context.sequenceFile(os.path.join(config.index,
+                                                                              preprocess.COLLECTION_TERM_COUNTS))
 
-        self.document_format = spark_context.sequenceFile(os.path.join(config.index, preprocess.DOC_FORMAT)).collectAsMap()[
-            'format']
+        self.document_format = spark_context.sequenceFile(os.path.join(config.index,preprocess.DOC_FORMAT)) \
+            .collectAsMap()['format']
+
+        self.prepare_data()
+
+    def prepare_data(self):
+        """
+        A general utility method to make data operations easier. When defining custom behavior, a class inheriting
+        from DocumentHandler can override this method to do any preparation necessary before documents are processed.
+        """
+        pass
 
     @staticmethod
     def all_query_terms(queries):
