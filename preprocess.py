@@ -146,11 +146,21 @@ class TrecWebParser(TrecTextParser):
         return BeautifulSoup(document, 'lxml')
 
 
+class ParsedDocumentParser(Parser):
+    """
+    Exists to alleviate the reading of documents that have been parsed as part of preprocessing. Rather than having
+    to override the DocumentHandler, this Parser simply returns the preparsed document (most likely a dictionary of
+    term counts, though other preprocessing techniques could certainly be implemented).
+    """
+    def parse(self, document):
+        return document
+
+
 parsers = {
     'trectext': TrecTextParser,
     'trecweb': TrecWebParser,
-    'warc': None,
     'text': Parser,
+    'preparsed': ParsedDocumentParser,
 }
 
 
@@ -162,6 +172,9 @@ def arguments():
     options.add_argument('-i', '--index', help='The output directory for all index files.')
     options.add_argument('-f', '--doc-format', choices=parsers.keys(), help='The format of the input document.')
     options.add_argument('-p', '--partitions', type=int, help='The minimum number of partitions to use.', default=None)
+    options.add_argument('--full-docs', action='store_true', help='Stores the full document representation. The '
+                                                                  'default behavior is reduce documents to a '
+                                                                  'dictionary of term counts.')
     args = options.parse_args()
 
     # Load the configuration file
@@ -196,14 +209,28 @@ if __name__ == '__main__':
     data_files = sc.wholeTextFiles(config.data_dir, minPartitions=config.partitions)
     docs = parser.split(data_files).cache()
 
-    # Save the document as a flattened (docno, doctext) SequenceFile for more efficient reading later
-    docs.saveAsSequenceFile(os.path.join(config.index, FLATTENED_DOCS))
+    if config.full_docs:
+        # Save the document as a flattened (docno, doctext) SequenceFile for more efficient reading later
+        docs.saveAsSequenceFile(os.path.join(config.index, FLATTENED_DOCS))
 
     # Count the frequency of each term in the full collection
-    term_counts = docs \
-        .map(lambda docno_doc: docno_doc[1]) \
-        .map(parser.parse) \
-        .map(lambda terms: Counter(terms)) \
+    doc_vectors = docs \
+        .mapValues(parser.parse) \
+        .mapValues(lambda terms: dict(Counter(terms))) \
+        .cache()
+
+    if not config.full_docs:
+        # Save the document as a bag of words (docno, {term: count, term2: count2, ...}) SequenceFile.
+        # This option can lead to significantly faster searches, but throws away structural information about the
+        # document.
+        doc_vectors.saveAsSequenceFile(os.path.join(config.index, FLATTENED_DOCS))
+
+        # We also need to adjust the format to store for this index, since the documents are now pre-parsed rather
+        # than needing parsing at search time.
+        config.doc_format = 'preparsed'
+
+    term_counts = doc_vectors \
+        .map(lambda doc: doc[1]) \
         .flatMap(lambda term_counts: [(term, term_counts[term]) for term in term_counts]) \
         .reduceByKey(add) \
         .cache()
