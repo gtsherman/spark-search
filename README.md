@@ -6,6 +6,23 @@ An exercise in Apache Spark and information retrieval. Probably not ready for re
 
 Spark Search uses Apache Spark to conduct information retrieval research experiments. Instead of the traditional querying-an-index approach, the system performs some preprocessing of documents and then scores a set of queries against each document individually and in parallel. This ensures that each document in the collection will receive a score. It also simplifies thinking about the scoring process in a MapReduce environment.
 
+## Installation
+
+```bash
+# Clone the git repository
+git clone https://github.com/gtsherman/spark-search.git
+cd spark-search
+
+# Create and activate a virtualenv
+virtualenv venv
+source venv/bin/activate
+
+# Install the dependencies
+pip install -r requirements.txt
+```
+
+You will also need to download and install Apache Spark. Spark Search has been tested on Spark version 2.3.1.
+
 ## Configuration
 
 Spark Search can be configured using configuration files. These are python files containing any settings that need to be passed to the preprocess or scan scripts. For example, a configuration file for preprocessing might look like the following:
