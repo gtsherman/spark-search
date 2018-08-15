@@ -1,6 +1,6 @@
 # Spark Search
 
-An exercise in Apache Spark and information retrieval.
+An exercise in Apache Spark and information retrieval. Probably not ready for real world use!
 
 ## Overview
 
@@ -64,6 +64,10 @@ Because the `DocumentHandler` is responsible for fetching data, processing the d
 The `prepare_data()` method is called automatically during the initialization of any `DocumentHandler`. By default, this method does nothing, but it is a useful method to use in fetching data (perhaps using `self.spark_context`) or pre-computing figures. For example, one method for removing stop words from a query is to override the `prepare_data()` method:
 
 ```python
+from spark_search.querying.doc_handling import DirichletDocumentHandler
+from spark_search.stoplists import IndriStoplist
+
+
 class StoppedQueryDirichletDocumentHandler(DirichletDocumentHandler):
   def prepare_data(self):
     stoplist = IndriStoplist()
@@ -96,7 +100,8 @@ Since the required configuration file is actually just python code, custom `Docu
 If classes are defined in a separate file, be sure to import them into your configuration file, since the `DocumentHandler` may only be specified in the configuration file (not on the command line). A simple example follows:
 
 ```python
-from preprocess import JelinekMercerDocumentHandler
+from spark_search.querying.doc_handling import JelinekMercerDocumentHandler
+
 
 doc_handler = JelinekMercerDocumentHandler
 ```
@@ -104,7 +109,30 @@ doc_handler = JelinekMercerDocumentHandler
 Notice that the `doc_handler` is specified as the class name rather than assigned an instance of the class. This is because the `SparkContext` needs to be passed within `scan.py` to prevent issues with nested `SparkContext`s. In contrast, a `Stoplist` is self-contained and does not need to be instantiated within `scan.py`. It should therefore be instantiated as part of the configuration file:
 
 ```python
+from spark_search.stoplists import IndriStoplist
+
+
 stoplist = IndriStoplist()
 ```
 
 Remember to import `IndriStoplist` into your configuration file as well.
+
+## Working with Spark
+
+Because of the way that Spark packages functions and objects for distribution to data nodes, it is fairly common to encounter errors where the `SparkContext` is accidentally nested. It is extremely important to avoid accessing the `SparkContext` directly or indirectly in a function that will be accessed as part of the MapReduce process.
+
+This can be a subtle point. For example, the `document_processing()` method of `LanguageModelDocumentHandler` is called in the driver, which means it can access `SparkContext` without throwing errors. However, the result of that method is a function that applies a series of transformations to the document. This returned function is called as part of the MapReduce process, and therefore cannot contain references to the `SparkContext`.
+
+It also cannot contain references to any uncollected RDD because RDDs are evaluated lazily, which means they will not actually attempt to execute until data is needed. For example, every `DocumentHandler` has the `collection_stats` property referencing an RDD of the collection statistics. If this RDD were collected into a list or map, the property could be accessed in the returned function of `document_processing()`. But because it is an RDD, it is an indirect reference to the `SparkContext` and cannot be referenced.
+
+In general, you should:
+
+- Use `SparkContext` and RDDs as little as possible.
+- Employ the `prepare_data()` method in `DocumentHandler` to access and "download" (to the driver) any RDD data you do require, since this method is only called on the driver.
+- Follow Spark's advice to assign instance variables to local variables within a function. This is unintuitive, but can help prevent indirectly referencing objects and functions that access the `SparkContext`. For example:
+
+```python
+def foo(self):
+    bar = self.bar
+    return bar * 2
+```

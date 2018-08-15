@@ -1,15 +1,14 @@
 import importlib
-import json
-import math
 import os
 import sys
 from argparse import ArgumentParser
-from collections import Counter, defaultdict
+from collections import defaultdict
 
-from bs4 import BeautifulSoup
 from pyspark import SparkConf, SparkContext
 
 import preprocess
+from spark_search.querying.doc_handling import DirichletDocumentHandler
+from spark_search.querying.queries import load_queries
 
 
 def arguments():
@@ -41,200 +40,6 @@ def arguments():
                                'parameters.'.format(required_setting))
 
     return conf
-
-
-def load_queries(queries_file, file_format=None):
-    """
-    Load a raw queries file, inferring file type if necessary.
-    :param queries_file: The path to the raw queries file.
-    :param file_format: The format of the queries, either "json" or "title".
-    :return: A dictionary of {title: [term1, ..., termN]}
-    """
-    with open(queries_file) as f:
-        queries_raw = f.read().strip()
-
-    if file_format is None:
-        if queries_file.lower().endswith('.json'):
-            file_format = 'json'
-        else:
-            file_format = 'title'
-
-    return _parse_json_queries(queries_raw) if file_format == 'json' else _parse_title_queries(queries_raw)
-
-
-def _parse_json_queries(queries_raw):
-    queries_json = json.loads(queries_raw)
-    return {query['title']: [term for term in query['text'].strip().lower().split() if term] for query in queries_json[
-        'queries']}
-
-
-def _parse_title_queries(queries_raw):
-    queries_soup = BeautifulSoup(queries_raw, 'html.parser')  # not actually HTML, but it works fine
-    return {query.number.text.strip(): [term for term in query.find('text').text.strip().lower().split() if term] for
-                                        query in queries_soup.find_all('query')}
-
-
-def document_process_pipeline(*transformations):
-    def _transform(document):
-        for transformation in transformations:
-            document = transformation(document)
-        return document
-    return _transform
-
-
-class DocumentHandler(object):
-    def __init__(self, spark_context, queries, config, **kwargs):
-        self.spark_context = spark_context
-        self.queries = queries
-        self.config = config
-        for arg in kwargs:
-            setattr(self, arg, kwargs[arg])
-
-        self.collection_stats = spark_context.sequenceFile(os.path.join(config.index, preprocess.COLLECTION_STATS))
-        self.collection_total_terms = self.collection_stats.collectAsMap()[preprocess.TOTAL_TERMS]
-
-        self.collection_term_counts = spark_context.sequenceFile(os.path.join(config.index,
-                                                                              preprocess.COLLECTION_TERM_COUNTS))
-
-        self.document_format = spark_context.sequenceFile(os.path.join(config.index,preprocess.DOC_FORMAT)) \
-            .collectAsMap()['format']
-
-        self.prepare_data()
-
-    def prepare_data(self):
-        """
-        A general utility method to make data operations easier. When defining custom behavior, a class inheriting
-        from DocumentHandler can override this method to do any preparation necessary before documents are processed.
-        """
-        pass
-
-    @staticmethod
-    def all_query_terms(queries):
-        return set([term for q in queries for term in queries[q]])
-
-
-class LanguageModelDocumentHandler(DocumentHandler):
-    def document_processing(self):
-        return document_process_pipeline(preprocess.parsers[self.document_format](preprocess.Tokenizer()).parse, Counter)
-
-    def _collection_probs(self):
-        collection_total_terms = self.collection_total_terms
-        all_query_terms = self.all_query_terms
-        queries = self.queries
-
-        return self.collection_term_counts \
-            .filter(lambda term_count: term_count[0] in all_query_terms(queries)) \
-            .map(lambda term_count: (term_count[0], term_count[1] / collection_total_terms)) \
-            .collectAsMap()
-
-
-class DirichletDocumentHandler(LanguageModelDocumentHandler):
-    def scorer(self):
-        query_term_collection_probabilities = self._collection_probs()
-        return DirichletScorer(self.queries, self.collection_total_terms, query_term_collection_probabilities)
-
-
-class JelinekMercerDocumentHandler(LanguageModelDocumentHandler):
-    def scorer(self):
-        query_term_collection_probabilities = self._collection_probs()
-        return JelinekMercerScorer(self.queries, self.collection_total_terms, query_term_collection_probabilities)
-
-
-class Scorer(object):
-    def __init__(self, queries):
-        self.queries = queries
-
-
-class LanguageModelScorer(Scorer):
-    def __init__(self, queries, collection_total_terms=1, term_collection_probabilities=None):
-        super().__init__(queries)
-        self.term_collection_probabilities = term_collection_probabilities
-        self.collection_total_terms = collection_total_terms
-
-    def _default_prob(self):
-        collection_total_terms = self.collection_total_terms
-        return 1 / collection_total_terms
-
-
-class JelinekMercerScorer(LanguageModelScorer):
-    def __init__(self, queries, collection_total_terms=1, term_collection_probabilities=None, orig_weight=0.5):
-        super().__init__(queries, collection_total_terms, term_collection_probabilities)
-        self.orig_weight = orig_weight
-
-    def score(self, document):
-        queries = self.queries
-        term_collection_probabilities = self.term_collection_probabilities
-        orig_weight = self.orig_weight
-
-        document_vector = document
-
-        # Term probabilities default to 0 if none are provided
-        if term_collection_probabilities is None:
-            term_collection_probabilities = defaultdict(int)
-        else:
-            term_collection_probabilities = defaultdict(self._default_prob, term_collection_probabilities)
-
-        # Document length is the sum of the counts of the individual terms in the document
-        document_length = sum(document_vector.values())
-
-        # We will collect the probability of each query given this document
-        query_doc_scores = []
-        for query in queries:
-            query_terms = queries[query]
-
-            # Compute the score for this query
-            q_norm = 1 / len(query_terms)
-            query_prob = q_norm * sum([math.log(orig_weight * ((document_vector[term]) / (document_length + 1)) +
-                                                (1 - orig_weight) * term_collection_probabilities[term])
-                                       for term in query_terms])
-
-            query_doc_scores.append((query, query_prob))
-
-        return query_doc_scores
-
-
-class DirichletScorer(LanguageModelScorer):
-    def __init__(self, queries, collection_total_terms=1, term_collection_probabilities=None, mu=2500):
-        super().__init__(queries, collection_total_terms, term_collection_probabilities)
-        self.mu = mu
-
-    def score(self, document):
-        """
-        Scores a list of queries against a document using Dirichlet-smoothed query likelihood scoring.
-        :param document: A dictionary of type {term: term_count}
-        :return: A list of (query_title, query_probability) tuples for each query provided.
-        """
-
-        # A weird little hack that makes Spark processing more efficient by allowing the function to be shipped
-        # without the remainder of the scorer object.
-        queries = self.queries
-        term_collection_probabilities = self.term_collection_probabilities
-        mu = self.mu
-
-        document_vector = document
-
-        # Term probabilities default to 0 if none are provided
-        if term_collection_probabilities is None:
-            term_collection_probabilities = defaultdict(int)
-        else:
-            term_collection_probabilities = defaultdict(self._default_prob, term_collection_probabilities)
-
-        # Document length is the sum of the counts of the individual terms in the document
-        document_length = sum(document_vector.values())
-
-        # We will collect the probability of each query given this document
-        query_doc_scores = []
-        for query in queries:
-            query_terms = queries[query]
-
-            # Compute the score for this query
-            q_norm = 1 / len(query_terms)
-            query_prob = q_norm * sum([math.log((document_vector[term] + mu * term_collection_probabilities[term]) /
-                                                (document_length + mu)) for term in query_terms])
-
-            query_doc_scores.append((query, query_prob))
-
-        return query_doc_scores
 
 
 def trec_format(results, run_name='submitted'):
